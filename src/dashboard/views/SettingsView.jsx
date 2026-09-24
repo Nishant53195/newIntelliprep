@@ -1,11 +1,10 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { collection, getDocs, doc, updateDoc } from 'firebase/firestore';
 import { firestoreDb } from '../../firebase/firestore/config';
-import useLoginStore from '../../login/store/loginStore';
+import { db } from '../../db/dexieDb';
 import styles from '../Dashboard.module.css';
 
-export default function SettingsView({user,userProfile,setUserProfile,setActiveNav }) {
-
+export default function SettingsView({ user, userProfile, setUserProfile, setActiveNav }) {
   const [subjectsList, setSubjectsList] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -15,60 +14,83 @@ export default function SettingsView({user,userProfile,setUserProfile,setActiveN
   const [primarySubject, setPrimarySubject] = useState(userProfile?.ongoingsubject1 || '');
   const [secondarySubject, setSecondarySubject] = useState(userProfile?.ongoingsubject2 || '');
 
-  // 1. Fetch all master GS subjects and compute total topics + subtopics
   useEffect(() => {
     let isMounted = true;
 
-    async function fetchMasterSubjects() {
+    async function loadSubjects() {
       setLoading(true);
       setErrorMsg('');
 
       try {
+        // 1. Instant check from Dexie local database[cite: 24, 25]
+        const localSubjects = await db.master_gs_subjects.toArray();
+        if (isMounted && localSubjects.length > 0) {
+          setSubjectsList(localSubjects);
+          setLoading(false);
+          return;
+        }
+
+        // 2. Fallback to Firestore if background fetch is still in progress[cite: 24]
         const subjectsColRef = collection(firestoreDb, 'master_gs_subjects');
         const subjectsSnapshot = await getDocs(subjectsColRef);
 
-        const subjectsWithCounts = await Promise.all(
+        const completeSubjectsData = await Promise.all(
           subjectsSnapshot.docs.map(async (subjectDoc) => {
             const subjectData = subjectDoc.data();
             const subjectId = subjectDoc.id;
 
-            // Query nested 'topic' subcollection
             const topicsColRef = collection(firestoreDb, 'master_gs_subjects', subjectId, 'topics');
             const topicsSnapshot = await getDocs(topicsColRef);
-            const totalTopics = topicsSnapshot.size;
 
-            // Query nested 'subtopic' subcollections for every topic
-            let totalSubtopics = 0;
-            const subtopicPromises = topicsSnapshot.docs.map((topicDoc) => {
-              const subtopicsColRef = collection(
-                firestoreDb,
-                'master_gs_subjects',
-                subjectId,
-                'topics',
-                topicDoc.id,
-                'subtopics'
-              );
-              return getDocs(subtopicsColRef);
-            });
+            let totalSubtopicsCount = 0;
 
-            const subtopicSnapshots = await Promise.all(subtopicPromises);
-            subtopicSnapshots.forEach((snap) => {
-              totalSubtopics += snap.size;
-            });
+            const topicsWithSubtopics = await Promise.all(
+              topicsSnapshot.docs.map(async (topicDoc) => {
+                const topicData = topicDoc.data();
+                const topicId = topicDoc.id;
+
+                const subtopicsColRef = collection(
+                  firestoreDb,
+                  'master_gs_subjects',
+                  subjectId,
+                  'topics',
+                  topicId,
+                  'subtopics'
+                );
+                const subtopicsSnapshot = await getDocs(subtopicsColRef);
+
+                const subtopics = subtopicsSnapshot.docs.map((subDoc) => ({
+                  id: subDoc.id,
+                  ...subDoc.data(),
+                }));
+
+                totalSubtopicsCount += subtopics.length;
+
+                return {
+                  id: topicId,
+                  ...topicData,
+                  subtopicsCount: subtopics.length,
+                  subtopics: subtopics,
+                };
+              })
+            );
 
             return {
               id: subjectId,
+              ...subjectData,
               name: subjectData.name || subjectId,
               paper: subjectData.paper || '',
               type: subjectData.type || '',
-              totalTopics,
-              totalSubtopics,
+              totalTopics: topicsWithSubtopics.length,
+              totalSubtopics: totalSubtopicsCount,
+              topics: topicsWithSubtopics,
             };
           })
         );
 
         if (isMounted) {
-          setSubjectsList(subjectsWithCounts);
+          await db.master_gs_subjects.bulkPut(completeSubjectsData);
+          setSubjectsList(completeSubjectsData);
           setLoading(false);
         }
       } catch (err) {
@@ -80,19 +102,17 @@ export default function SettingsView({user,userProfile,setUserProfile,setActiveN
       }
     }
 
-    fetchMasterSubjects();
+    loadSubjects();
 
     return () => {
       isMounted = false;
     };
   }, []);
 
-  // Filter available options for secondary dropdown
   const secondaryOptions = useMemo(() => {
     return subjectsList.filter((s) => s.id !== primarySubject);
   }, [subjectsList, primarySubject]);
 
-  // Handle Primary Subject Selection
   const handlePrimaryChange = (e) => {
     const selectedId = e.target.value;
     setPrimarySubject(selectedId);
@@ -101,7 +121,6 @@ export default function SettingsView({user,userProfile,setUserProfile,setActiveN
     }
   };
 
-  // 2. Submit handler to update master_users
   const handleUpdate = async (e) => {
     e.preventDefault();
     setErrorMsg('');
@@ -126,9 +145,16 @@ export default function SettingsView({user,userProfile,setUserProfile,setActiveN
         updatedAt: new Date().toISOString(),
       };
 
+      // 1. Update Firestore[cite: 24]
       await updateDoc(userDocRef, updatePayload);
 
-      // Synchronize Zustand global store
+      // 2. Sync updated user profile to Dexie[cite: 25]
+      const currentLocal = await db.users.get(user.uid);
+      if (currentLocal) {
+        await db.users.put({ ...currentLocal, ...updatePayload });
+      }
+
+      // 3. Update Zustand Store[cite: 24]
       if (setUserProfile) {
         setUserProfile({
           ...userProfile,
@@ -139,7 +165,7 @@ export default function SettingsView({user,userProfile,setUserProfile,setActiveN
       setSuccessMsg('Preparation track updated successfully! Redirecting...');
       setTimeout(() => {
         if (setActiveNav) setActiveNav('Dashboard');
-      }, 1200);
+      }, 1000);
     } catch (err) {
       console.error('Failed to update user subjects:', err);
       setErrorMsg('Failed to save your selections. Please try again.');
@@ -179,7 +205,6 @@ export default function SettingsView({user,userProfile,setUserProfile,setActiveN
           gap: '1.5rem',
         }}
       >
-        {/* Header Block */}
         <div>
           <h2 style={{ color: '#f8fafc', fontSize: '1.35rem', fontWeight: 800, margin: '0 0 0.4rem 0' }}>
             Preparation Track Settings
@@ -189,7 +214,6 @@ export default function SettingsView({user,userProfile,setUserProfile,setActiveN
           </p>
         </div>
 
-        {/* Alerts */}
         {errorMsg && (
           <div style={{
             background: 'rgba(239, 68, 68, 0.12)',
@@ -216,7 +240,6 @@ export default function SettingsView({user,userProfile,setUserProfile,setActiveN
           </div>
         )}
 
-        {/* Settings Form Container */}
         <form
           onSubmit={handleUpdate}
           style={{
@@ -229,7 +252,6 @@ export default function SettingsView({user,userProfile,setUserProfile,setActiveN
             gap: '1.4rem',
           }}
         >
-          {/* Dropdown 1: Primary Subject */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
             <label style={{ color: '#f8fafc', fontSize: '0.84rem', fontWeight: 600 }}>
               Primary Subject <span style={{ color: '#ef4444' }}>*</span>
@@ -261,7 +283,6 @@ export default function SettingsView({user,userProfile,setUserProfile,setActiveN
             </select>
           </div>
 
-          {/* Dropdown 2: Secondary Subject */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
             <label style={{ color: '#f8fafc', fontSize: '0.84rem', fontWeight: 600 }}>
               Secondary Subject <span style={{ color: '#64748b', fontWeight: 400 }}>(Optional)</span>
@@ -294,7 +315,6 @@ export default function SettingsView({user,userProfile,setUserProfile,setActiveN
             </select>
           </div>
 
-          {/* Discipline Advisory Note */}
           <div
             style={{
               background: 'rgba(239, 68, 68, 0.08)',
@@ -316,7 +336,6 @@ export default function SettingsView({user,userProfile,setUserProfile,setActiveN
             </span>
           </div>
 
-          {/* Submit Button */}
           <button
             type="submit"
             disabled={saving || !primarySubject}

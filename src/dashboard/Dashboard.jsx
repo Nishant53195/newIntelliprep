@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { doc, getDoc } from 'firebase/firestore';
+import { doc, getDoc, collection, getDocs } from 'firebase/firestore';
 import { firestoreDb } from '../firebase/firestore/config';
 import useLoginStore from '../login/store/LoginStore';
 import HomeFeedView from './views/HomeFeedView';
 import SettingsView from './views/SettingsView';
+import PrelimsPYQView from './views/PrelimsPYQView';
+import MainsPYQView from './views/MainsPYQView';
 import styles from './Dashboard.module.css';
 import { db } from '../db/dexieDb';
 
@@ -12,7 +14,7 @@ export default function Dashboard() {
   const user = useLoginStore((state) => state.user);
   const setUserProfile = useLoginStore((state) => state.setUserProfile);
   const userProfile = useLoginStore((state) => state.userProfile);
-  const logout = useLoginStore((state) => state.logout); // Optional: if exposed by your store
+  const logout = useLoginStore((state) => state.logout);
 
   const [activeNav, setActiveNav] = useState('Dashboard');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -21,7 +23,6 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Interactive Daily Goals
   const [dailyGoals, setDailyGoals] = useState([
     { id: 1, title: 'Study Ancient History', progress: '2 / 3 topics', completed: true },
     { id: 2, title: 'Solve 20 MCQs (Polity)', progress: '0 / 20', completed: false },
@@ -60,6 +61,7 @@ export default function Dashboard() {
     { name: 'Important Notes', targetNav: 'Study Plan', icon: 'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5', color: '#f43f5e' }
   ];
 
+  // 1. Fetch User Profile (Dexie first, then Firestore fallback)[cite: 22]
   useEffect(() => {
     let isMounted = true;
 
@@ -70,7 +72,6 @@ export default function Dashboard() {
       }
 
       try {
-        // 1. Try local Dexie cache
         const localData = await db.users.get(user.uid);
         if (isMounted && localData) {
           setProfileData(localData);
@@ -79,7 +80,6 @@ export default function Dashboard() {
           return;
         }
 
-        // 2. Fetch from Firestore if cache misses
         const userDocRef = doc(firestoreDb, 'master_users', user.uid);
         const docSnap = await getDoc(userDocRef);
 
@@ -109,6 +109,93 @@ export default function Dashboard() {
     };
   }, [user, navigate, setUserProfile]);
 
+  // 2. Fetch full micro-syllabus hierarchy into Dexie
+  useEffect(() => {
+    let isMounted = true;
+
+    async function syncEntireMasterSubjects() {
+      try {
+        const cachedCount = await db.master_gs_subjects.count();
+        if (cachedCount > 0) {
+          return; // Poora data pehle se Dexie me saved hai[cite: 24, 25]
+        }
+
+        // Pura subjects collection uthao
+        const subjectsColRef = collection(firestoreDb, 'master_gs_subjects');
+        const subjectsSnapshot = await getDocs(subjectsColRef);
+
+        const completeSubjectsData = await Promise.all(
+          subjectsSnapshot.docs.map(async (subjectDoc) => {
+            const subjectData = subjectDoc.data();
+            const subjectId = subjectDoc.id;
+
+            // Is subject ke saare topics uthao[cite: 24]
+            const topicsColRef = collection(firestoreDb, 'master_gs_subjects', subjectId, 'topics');
+            const topicsSnapshot = await getDocs(topicsColRef);
+
+            let totalSubtopicsCount = 0;
+
+            // Har topic ke nested subtopics uthao[cite: 24]
+            const topicsWithSubtopics = await Promise.all(
+              topicsSnapshot.docs.map(async (topicDoc) => {
+                const topicData = topicDoc.data();
+                const topicId = topicDoc.id;
+
+                const subtopicsColRef = collection(
+                  firestoreDb,
+                  'master_gs_subjects',
+                  subjectId,
+                  'topics',
+                  topicId,
+                  'subtopics'
+                );
+                const subtopicsSnapshot = await getDocs(subtopicsColRef);
+
+                const subtopics = subtopicsSnapshot.docs.map((subDoc) => ({
+                  id: subDoc.id,
+                  ...subDoc.data(),
+                }));
+
+                totalSubtopicsCount += subtopics.length;
+
+                return {
+                  id: topicId,
+                  ...topicData,
+                  subtopicsCount: subtopics.length,
+                  subtopics: subtopics, // <-- Pura subtopic data yahan array me store hai
+                };
+              })
+            );
+
+            return {
+              id: subjectId,
+              ...subjectData,
+              name: subjectData.name || subjectId,
+              paper: subjectData.paper || '',
+              type: subjectData.type || '',
+              totalTopics: topicsWithSubtopics.length,
+              totalSubtopics: totalSubtopicsCount,
+              topics: topicsWithSubtopics, // <-- Pura topic hierarchy yahan array me store hai
+            };
+          })
+        );
+
+        if (isMounted && completeSubjectsData.length > 0) {
+          // Bulk put complete objects with topics & subtopics into Dexie[cite: 25]
+          await db.master_gs_subjects.bulkPut(completeSubjectsData);
+        }
+      } catch (err) {
+        console.error('Background full sync for master_gs_subjects failed:', err);
+      }
+    }
+
+    syncEntireMasterSubjects();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
   const toggleGoal = (id) => {
     setDailyGoals((prev) =>
       prev.map((goal) => (goal.id === id ? { ...goal, completed: !goal.completed } : goal))
@@ -120,7 +207,6 @@ export default function Dashboard() {
     navigate('/login', { replace: true });
   };
 
-  // Center Workspace Router
   const renderWorkspace = () => {
     switch (activeNav) {
       case 'Dashboard':
@@ -134,6 +220,13 @@ export default function Dashboard() {
             setActiveNav={setActiveNav}
           />
         );
+
+      case 'Prelims PYQs': // <-- Yeh case add karein
+      return <PrelimsPYQView user={user} />;
+
+      case 'Mains PYQs': // <-- Yeh case add karein
+      return <MainsPYQView user={user} />;
+
       default:
         return (
           <div className={styles.workspaceScroll}>
@@ -358,7 +451,6 @@ export default function Dashboard() {
           </div>
         </header>
 
-        {/* Dynamic Center Component */}
         {renderWorkspace()}
       </main>
 
