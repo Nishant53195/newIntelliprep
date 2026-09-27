@@ -7,6 +7,8 @@ import HomeFeedView from './views/HomeFeedView';
 import SettingsView from './views/SettingsView';
 import PrelimsPYQView from './views/PrelimsPYQView';
 import MainsPYQView from './views/MainsPYQView';
+import SyllabusView from './views/SyllabusView';
+import CurrentAffairsView from './views/CurrentAffairsView';
 import styles from './Dashboard.module.css';
 import { db } from '../db/dexieDb';
 
@@ -196,6 +198,124 @@ export default function Dashboard() {
     };
   }, []);
 
+
+    useEffect(() => {
+    let isMounted = true;
+
+    async function syncEntireOptionalSubjects() {
+      try {
+        if (!db.master_optional_subjects) return;
+
+        const cachedCount = await db.master_optional_subjects.count();
+        if (cachedCount > 0) {
+          return; // Pura data pehle se Dexie me saved hai
+        }
+
+        // Pura optional subjects collection fetch karein
+        const subjectsColRef = collection(firestoreDb, 'master_optional_subjects');
+        const subjectsSnapshot = await getDocs(subjectsColRef);
+
+        const completeSubjectsData = await Promise.all(
+          subjectsSnapshot.docs.map(async (subjectDoc) => {
+            const subjectData = subjectDoc.data();
+            const subjectId = subjectDoc.id;
+
+            // Optional subject ID se prefix nikal kar paper collection name banana
+            // Example: "psir_optional" -> "paper_1_psir" & "paper_2_psir"
+            const basePrefix = subjectId.split('_')[0];
+            const paper1ColName = `paper_1_${basePrefix}`;
+            const paper2ColName = `paper_2_${basePrefix}`;
+
+            // Helper function: Kisi bhi paper collection ke topics aur nested subtopics fetch karna
+            const fetchPaperTopics = async (paperColName) => {
+              try {
+                const paperColRef = collection(
+                  firestoreDb,
+                  'master_optional_subjects',
+                  subjectId,
+                  paperColName
+                );
+                const paperSnapshot = await getDocs(paperColRef);
+
+                return await Promise.all(
+                  paperSnapshot.docs.map(async (topicDoc) => {
+                    const topicData = topicDoc.data();
+                    const topicId = topicDoc.id;
+
+                    const subtopicsColRef = collection(
+                      firestoreDb,
+                      'master_optional_subjects',
+                      subjectId,
+                      paperColName,
+                      topicId,
+                      'subtopics'
+                    );
+                    const subtopicsSnapshot = await getDocs(subtopicsColRef);
+
+                    const subtopics = subtopicsSnapshot.docs
+                      .map((subDoc) => ({
+                        id: subDoc.id,
+                        ...subDoc.data(),
+                      }))
+                      .sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0));
+
+                    return {
+                      id: topicId,
+                      ...topicData,
+                      subtopicsCount: subtopics.length,
+                      subtopics,
+                    };
+                  })
+                );
+              } catch (subErr) {
+                console.warn(`Could not load ${paperColName} for ${subjectId}:`, subErr);
+                return [];
+              }
+            };
+
+            // Dono papers ke topics & subtopics parallel fetch karein
+            const [paper1Topics, paper2Topics] = await Promise.all([
+              fetchPaperTopics(paper1ColName),
+              fetchPaperTopics(paper2ColName),
+            ]);
+
+            // Sequence sorting
+            paper1Topics.sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0));
+            paper2Topics.sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0));
+
+            const paper1SubCount = paper1Topics.reduce((acc, t) => acc + (t.subtopicsCount || 0), 0);
+            const paper2SubCount = paper2Topics.reduce((acc, t) => acc + (t.subtopicsCount || 0), 0);
+
+            return {
+              id: subjectId,
+              ...subjectData,
+              name: subjectData.name || subjectData['subject name'] || subjectData.subjectName || subjectId,
+              paper1Collection: paper1ColName,
+              paper2Collection: paper2ColName,
+              paper1Topics,
+              paper2Topics,
+              totalTopics: paper1Topics.length + paper2Topics.length,
+              totalSubtopics: paper1SubCount + paper2SubCount,
+            };
+          })
+        );
+
+        if (isMounted && completeSubjectsData.length > 0) {
+          // Dexie master_optional_subjects table me save karein
+          await db.master_optional_subjects.bulkPut(completeSubjectsData);
+        }
+      } catch (err) {
+        console.error('Background full sync for master_optional_subjects failed:', err);
+      }
+    }
+
+    syncEntireOptionalSubjects();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
   const toggleGoal = (id) => {
     setDailyGoals((prev) =>
       prev.map((goal) => (goal.id === id ? { ...goal, completed: !goal.completed } : goal))
@@ -226,6 +346,12 @@ export default function Dashboard() {
 
       case 'Mains PYQs': // <-- Yeh case add karein
       return <MainsPYQView user={user} />;
+
+      case 'Syllabus': // <-- Yeh case add karein
+      return <SyllabusView user={user} />;
+
+      case 'Current Affairs': // <-- Yeh case add karein
+      return <CurrentAffairsView user={user} />;
 
       default:
         return (
